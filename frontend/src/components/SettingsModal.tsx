@@ -75,6 +75,9 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
   }, [])
+  // 注意：所有 hooks 必须在此之上——下面的提前 return 之后不允许再出现 hooks（React #310）
+  const [bgmUploading, setBgmUploading] = useState(false)
+  const [bgmError, setBgmError] = useState('')
   if (!s) return null
 
   const markDirty = (next: Settings) => {
@@ -118,8 +121,6 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const updBgm = (patch: Partial<Settings['bgm']>) =>
     markDirty({ ...s, bgm: { ...(s.bgm || { enabled: true, volume: 0.08, path: 'bgm.mp3' }), ...patch } })
 
-  const [bgmUploading, setBgmUploading] = useState(false)
-  const [bgmError, setBgmError] = useState('')
   const onUploadBgm = async (file: File | null) => {
     if (!file) return
     setBgmUploading(true); setBgmError('')
