@@ -89,10 +89,12 @@ def put_settings(payload: dict):
         k = p.get("api_key", "")
         if old and ("…" in k or set(k) == {"*"} or (k == "" and old.get("api_key"))):
             p["api_key"] = old["api_key"]
-    # voice key 同理
+    # voice key 同理：省略号 / 星号掩码 / 留空都保留旧 key
+    # （掩码是 ******** 形态，漏判会把星号当真 key 覆盖落盘 → 线上 TTS 全部 401）
     v_old = current.get("voice", {})
     v_new = incoming.get("voice", {})
-    if "…" in v_new.get("minimax_api_key", "") or v_new.get("minimax_api_key", "") == "":
+    vk = v_new.get("minimax_api_key", "")
+    if "…" in vk or set(vk) == {"*"} or vk == "":
         v_new["minimax_api_key"] = v_old.get("minimax_api_key", "")
     incoming["voice"] = {**v_old, **v_new}
     # 飞书凭据同理：脱敏回传或留空时保留旧值

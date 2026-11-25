@@ -399,6 +399,29 @@ def case_voice_mask():
     check("F 服务端注册表保留完整 voice_id", raw == "voice-full-id-1234")
 
 
+def case_voice_key_mask_roundtrip():
+    """脱敏掩码回写保护：前端保存时带回 ******** 不得覆盖真实 MiniMax key。
+
+    回归 bug：PUT 只判省略号/空串，漏判星号掩码 → 保存设置后真实 key 被覆盖为
+    字面 "********"，TTS 测试/合成全部 401。"""
+    set_settings(TOKEN)
+    s = store.load_settings()
+    s["voice"]["minimax_api_key"] = "mm-real-key-88d2"
+    store.save_settings(s)
+
+    c = TestClient(app)
+    r = c.get("/api/settings", headers=auth_hdr())
+    masked = r.json()["voice"]["minimax_api_key"]
+    check("G 前端拿到的 minimax key 为掩码", masked == "********", masked)
+
+    s2 = store.load_settings()
+    s2["voice"]["minimax_api_key"] = masked  # 模拟前端原样回传
+    r2 = c.put("/api/settings", json=s2, headers=auth_hdr())
+    check("G 掩码回写保存成功", r2.status_code == 200, str(r2.status_code))
+    saved = store.load_settings()["voice"]["minimax_api_key"]
+    check("G 保存后真实 key 未被覆盖", saved == "mm-real-key-88d2", repr(saved))
+
+
 # ---------- 主流程 ----------
 
 def main():
@@ -414,6 +437,7 @@ def main():
     case_code_exec_switch()
     case_ssrf()
     case_voice_mask()
+    case_voice_key_mask_roundtrip()
 
     passed = sum(1 for _, ok, _ in results if ok)
     print(f"\n===== {passed}/{len(results)} 通过 =====")
