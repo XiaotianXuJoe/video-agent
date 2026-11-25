@@ -8,6 +8,7 @@ FastAPI + React 的对话式讲解视频生产 Agent；后端单进程，前端�
 
 - `cd backend && python3 test_modify_flow.py` —— 修改流（17 断言，必须全过）
 - `cd backend && python3 test_chat_persistence.py` —— 落盘可见性（8 断言，必须全过）
+- `cd backend && python3 test_security.py` —— 安全回归（鉴权/路径穿越/密钥外发/执行加固/SSRF，必须全过）
 - `cd frontend && npm run build` —— 含 `tsc -b`，类型错误必须为零
 - 其余 `backend/test_*.py` 为专项回归，改动对应模块时必跑
 

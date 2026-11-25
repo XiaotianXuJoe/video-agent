@@ -1,13 +1,15 @@
 """FastAPI 入口：API 路由 + SSE + 静态托管前端产物。"""
 import json
+import re
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import annotations, artifacts, store
+from . import annotations, artifacts, auth, store
 from .agent import chat as chat_agent
 from .pipeline import machine
 
@@ -15,6 +17,8 @@ BASE = Path(__file__).resolve().parent.parent
 DIST = BASE.parent / "frontend" / "dist"
 
 app = FastAPI(title="讲解视频 Agent")
+# 全站鉴权：/api/* 全部要求 token（/api/auth/login 除外）。静态前端公开，保证登录页能加载。
+app.add_middleware(auth.AuthMiddleware)
 store.init_db()
 
 # 启动收割：进程重启后，状态仍停留在 running 的项目永远等不到事件——标记为失败以便重试
@@ -26,6 +30,42 @@ for _p in store.list_projects():
         _st["error"] = "服务重启导致流水线中断，可用「重试」从当前阶段继续"
         machine.save_state(_dir, _st)
         store.update_project(_p["id"], state="failed")
+
+
+# ---------- 鉴权（单用户 token） ----------
+
+class LoginIn(BaseModel):
+    password: str
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginIn, request: Request):
+    """密码即 settings.auth.token。成功时下发 HttpOnly cookie（供 img/video/EventSource）。"""
+    expected = auth.configured_token()
+    if not expected:
+        return JSONResponse({"error": {"kind": "auth_unconfigured",
+                                       "detail": "服务端尚未配置访问密码（auth.token）"}},
+                            status_code=401)
+    ip = request.client.host if request.client else "unknown"
+    if auth.login_rate_limited(ip):
+        return JSONResponse({"error": {"kind": "rate_limited",
+                                       "detail": "尝试过于频繁，请一分钟后再试"}},
+                            status_code=429)
+    if not auth.token_matches((body.password or "").strip(), expected):
+        return JSONResponse({"error": {"kind": "auth_failed", "detail": "密码错误"}},
+                            status_code=401)
+    resp = JSONResponse({"ok": True})
+    # 纯 HTTP 环境：不加 Secure（加了浏览器会拒收 cookie）；SameSite=Strict 防 CSRF
+    resp.set_cookie(auth.COOKIE_NAME, expected, max_age=auth.COOKIE_MAX_AGE,
+                    httponly=True, samesite="strict", path="/")
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(auth.COOKIE_NAME, path="/")
+    return resp
 
 
 # ---------- 设置 ----------
@@ -62,43 +102,97 @@ def put_settings(payload: dict):
         f_new["app_secret"] = f_old.get("app_secret", "")
     incoming["feishu"] = {**f_old, **f_new}
     incoming["stage_models"] = {**current["stage_models"], **incoming.get("stage_models", {})}
+    # 访问密码同理：脱敏回传（********）或留空时保留旧值（也意味着不能在此清空密码）
+    a_old = current.get("auth", {})
+    a_new = dict(incoming.get("auth") or {})
+    a_new.pop("has_token", None)
+    tok = (a_new.get("token") or "").strip()
+    if set(tok) == {"*"} or tok == "":
+        a_new["token"] = a_old.get("token", "")
+    incoming["auth"] = {**a_old, **a_new}
+    incoming["security"] = {**current.get("security", {}), **(incoming.get("security") or {})}
+    # 创作规范 / 流水线参数 / BGM：逐键合并，未携带的沿用旧值
+    incoming["content_rules"] = {**current.get("content_rules", {}),
+                                 **(incoming.get("content_rules") or {})}
+    incoming["pipeline"] = {**current.get("pipeline", {}), **(incoming.get("pipeline") or {})}
+    incoming["bgm"] = {**current.get("bgm", {}), **(incoming.get("bgm") or {})}
     store.save_settings(incoming)
     return store.masked_settings()
 
 
+BGM_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+BGM_MAX_BYTES = 20 * 1024 * 1024
+
+
+@app.post("/api/settings/bgm")
+async def upload_bgm(file: UploadFile = File(...)):
+    """自定义 BGM 上传：只收音频后缀、限 20MB、文件名净化后存入 assets 目录。
+
+    只存文件，不自动改设置——前端上传成功后再把设置页里的「BGM 文件」指向它，
+    用户点保存才生效，避免一次误选就替换掉正在用的配乐。
+    """
+    original = Path(file.filename or "")
+    suffix = original.suffix.lower()
+    if suffix not in BGM_SUFFIXES:
+        raise HTTPException(status_code=400, detail={
+            "kind": "bad_file",
+            "detail": f"不支持的音频格式 {suffix or '(无后缀)'}，请用 "
+                      f"{' / '.join(sorted(BGM_SUFFIXES))}"})
+    stem = re.sub(r"[^A-Za-z0-9_-]", "_", original.stem)[:40] or "bgm"
+    name = f"bgm_{int(time.time())}_{stem}{suffix}"
+    target = store.ASSETS_DIR / name
+    total = 0
+    try:
+        with open(target, "wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > BGM_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail={
+                        "kind": "too_large",
+                        "detail": f"BGM 文件不能超过 {BGM_MAX_BYTES // (1024 * 1024)}MB"})
+                fh.write(chunk)
+    except HTTPException:
+        target.unlink(missing_ok=True)
+        raise
+    if total == 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail={"kind": "empty_file", "detail": "上传文件为空"})
+    return {"path": name, "bytes": total}
+
+
 class ProviderTestIn(BaseModel):
-    provider: dict  # 前端表单中的未保存值（type/base_url/model/api_key）
+    id: str
 
 
 @app.post("/api/settings/test_provider")
 async def test_provider(body: ProviderTestIn):
+    """连通性测试只接受「已保存供应商的 id」。
+    请求体里的 base_url / api_key 一律忽略——否则已存 key 会被发到攻击者域名（C-SEC-02）。"""
     from .llm import test_provider as _test
-    p = dict(body.provider)
-    # 表单里的 key 若是脱敏值，回取已保存的真实 key 再测
-    k = p.get("api_key", "")
-    if "…" in k or set(k) == {"*"} or not k:
-        old = store.get_provider(p.get("id", ""))
-        if old:
-            p["api_key"] = old["api_key"]
-    return await _test(p)
+    p = store.get_provider(body.id)
+    if not p:
+        raise HTTPException(404, "供应商尚未保存：请先保存设置，再测试连接")
+    return await _test(dict(p))
 
 
 @app.post("/api/settings/test_minimax")
-async def test_minimax(body: dict):
-    """MiniMax 连通性测试：表单未保存的 key 脱敏时回取已保存值。"""
+async def test_minimax():
+    """MiniMax 连通性测试：只用已保存配置（不接受请求体的 base_url / key）。"""
     import httpx as _hx
     import time as _t
     v = store.load_settings()["voice"]
-    key = body.get("api_key", "")
-    if "…" in key or set(key) == {"*"} or not key:
-        key = v.get("minimax_api_key", "")
-    base = (body.get("base_url") or v.get("minimax_base_url") or "").rstrip("/")
+    key = v.get("minimax_api_key", "")
+    base = (v.get("minimax_base_url") or "").rstrip("/")
     if not key:
-        return {"ok": False, "error": {"kind": "auth", "detail": "未填写 MiniMax API Key"}}
+        return {"ok": False, "error": {"kind": "auth",
+                                       "detail": "未填写 MiniMax API Key（请先在设置页填写并保存）"}}
     # 用真实配音管线同一个端点 /t2a_v2 做最小化合成测试（1 个字符），
     # 与正式 TTS 行为一致——chat/completions 不支持 speech 模型，不能当探测点。
-    model = body.get("model") or v.get("model") or "minimax-speech-2.8-hd"
-    voice_id = body.get("voice_id") or v.get("voice_id") or ""
+    model = v.get("model") or "minimax-speech-2.8-hd"
+    voice_id = v.get("voice_id") or ""
     t0 = _t.time()
     try:
         async with _hx.AsyncClient(timeout=_hx.Timeout(30, connect=10)) as client:
@@ -219,6 +313,15 @@ def get_project(pid: str):
             "stage_names": machine.STAGE_NAMES, "gates": machine.GATES}
 
 
+@app.get("/api/projects/{pid}/events")
+def project_events(pid: str, after: int = Query(0), limit: int = Query(500)):
+    """流水线事件回放（D1）：断线/刷新后按 seq 游标增量拉取，不再靠轮询猜进度。"""
+    if store.get_project(pid) is None:
+        raise HTTPException(404)
+    return {"events": store.list_project_events(pid, after, min(limit, 2000)),
+            "latest": store.latest_event_seq(pid)}
+
+
 @app.post("/api/projects/{pid}/run_stage")
 async def run_stage(pid: str, body: dict):
     """手动单点执行：重跑指定阶段后停下（门禁阶段进入待确认，其余进入 paused）。"""
@@ -254,7 +357,26 @@ async def stop_project(pid: str):
 
 @app.get("/api/projects/{pid}/artifacts")
 def list_artifacts(pid: str):
-    return artifacts.list_artifacts(store.project_dir(pid))
+    # 音色 ID 等敏感 extra 只回显后 4 位（C-SEC-09）
+    return artifacts.list_artifacts_masked(store.project_dir(pid))
+
+
+@app.get("/api/projects/{pid}/raw_responses")
+def list_raw_responses(pid: str):
+    """列出项目 raw_responses/ 下的模型原始响应（最新在前），供失败详情「查看最近原始响应」使用（C-UX-07）。
+    只回文件元信息；内容仍走 /file 端点，那里有路径校验与 no-cache。"""
+    proj_dir = store.project_dir(pid)
+    d = proj_dir / "raw_responses"
+    if not d.is_dir():
+        return {"latest": None, "files": []}
+    files = [p for p in d.iterdir() if p.is_file()]
+    try:
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    out = [{"name": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime}
+           for p in files[:50]]
+    return {"latest": out[0] if out else None, "files": out}
 
 
 @app.get("/api/projects/{pid}/file")
@@ -288,7 +410,9 @@ async def ingest(body: IngestIn):
     try:
         return await ingest_url(url)
     except IngestError as e:
-        raise HTTPException(502, {"kind": e.kind, "detail": e.detail})
+        # 被 SSRF 防护拒绝的地址属于「请求非法」，返回 400 而不是上游错误
+        raise HTTPException(400 if e.kind == "config" else 502,
+                            {"kind": e.kind, "detail": e.detail})
     except ProviderError as e:
         raise HTTPException(502, {"kind": e.kind, "detail": e.detail})
     except ValueError as e:
@@ -375,8 +499,11 @@ if DIST.exists():
         if full_path.startswith("api/"):
             raise HTTPException(404)
         target = (DIST / full_path).resolve()
-        if full_path and target.exists() and target.is_file() \
-                and str(target).startswith(str(DIST.resolve())):
+        try:
+            inside = target.relative_to(DIST.resolve()) is not None
+        except ValueError:
+            inside = False
+        if full_path and inside and target.is_file():
             return FileResponse(target)
         return FileResponse(DIST / "index.html",
                             headers={"Cache-Control": "no-cache"})

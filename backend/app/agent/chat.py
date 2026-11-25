@@ -1,6 +1,7 @@
 """对话编排：意图路由（新建/修改/问答）+ SSE 流式输出 + 动作消息处理。"""
 import asyncio
 import json
+import re
 from pathlib import Path
 
 from .. import artifacts, store
@@ -23,6 +24,88 @@ def _chat_provider():
         if q.get("api_key"):
             return q
     return None
+
+
+# ---------- 门禁自然语言确认（C-UX-01） ----------
+# 旧实现用单字「好」做子串匹配，「这个方案不太好」会被当成确认直接开跑下一阶段。
+# 现在：先排除否定/返工词（出现则绝不确认），再要求命中确认词；拿不准就不确认，
+# 交回修改流与显式按钮（门禁确认的首选交互始终是按钮）。
+GATE_NEGATIONS = ("不", "别", "否", "改", "换", "重新", "重来", "再想", "等等",
+                  "暂缓", "调整", "算了", "有问题")
+GATE_CONFIRMS = ("确认", "可以", "继续", "通过", "同意", "没问题", "往下", "下一步",
+                 "开跑", "没问题", "ok", "okay")
+# 整句恰好是这些短词时才算确认（不做子串匹配，避免「好」在任意句子里命中）
+GATE_BARE_CONFIRMS = {"好", "好的", "好滴", "行", "嗯", "是", "可以"}
+GATE_CONFIRM_MAX_LEN = 30
+
+
+def gate_confirmed(text: str) -> bool:
+    """门禁消息是否可判定为「用户确认通过」。
+
+    规则（顺序敏感）：否定/返工词优先 → 命中即否；随后确认词命中才算确认；
+    两者都没有（或句子过长、语义含糊）一律不确认，由调用方转修改流/提示按钮。
+    """
+    low = (text or "").strip().lower()
+    if not low or len(low) > GATE_CONFIRM_MAX_LEN:
+        return False
+    if any(w in low for w in GATE_NEGATIONS):
+        return False
+    bare = low.strip("。！!？?，,、~ \t\r\n")
+    if bare in GATE_BARE_CONFIRMS:
+        return True
+    return any(w in low for w in GATE_CONFIRMS)
+
+
+def _instruction_scene_ids(route: dict) -> set:
+    """修改路由里指定的镜头号：既看结构化 scene_ids，也解析 instruction 中的「第3镜/镜头3/#3/scene 3」。"""
+    ids = set()
+    for v in route.get("scene_ids") or []:
+        try:
+            ids.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    text = str(route.get("instruction") or "")
+    for m in re.finditer(r"(?:第\s*(\d+)\s*镜|镜头\s*(\d+)|#\s*(\d+)|scene\s*(\d+))",
+                         text, flags=re.IGNORECASE):
+        for g in m.groups():
+            if g:
+                ids.add(int(g))
+    return ids
+
+
+def _apply_tts_instruction(proj_dir: Path, route: dict) -> tuple[int, str]:
+    """把 tts 分支的修改写回 timeline.scenes[].tts（C-UX-02）。
+    指定了镜头号 → 只改对应镜头（替换为该镜改后的 TTS 文本）；
+    未指定 → 逐镜追加修改文本，保证每一镜的配音缓存签名都变化、确实重新合成。
+    返回 (改动镜头数, 描述)。"""
+    tl_path = proj_dir / "timeline.json"
+    if not tl_path.exists():
+        raise RuntimeError("项目缺少 timeline.json，无法应用配音文本修改")
+    timeline = machine._read_json(tl_path)
+    instruction = (route.get("instruction") or "").strip()
+    if not instruction:
+        raise RuntimeError("修改路由未给出具体的配音文本（instruction 为空）")
+    ids = _instruction_scene_ids(route)
+    changed = 0
+    for sc in timeline.get("scenes", []):
+        try:
+            sid = int(sc.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if ids and sid not in ids:
+            continue
+        if ids:
+            sc["tts"] = instruction
+        else:
+            base = (sc.get("tts") or sc.get("narration") or "").strip()
+            if instruction not in base:
+                sc["tts"] = f"{base}\n{instruction}" if base else instruction
+        changed += 1
+    if changed == 0:
+        raise RuntimeError(f"没有匹配到镜头（指定镜头号：{sorted(ids) or '全部'}），请说明要改第几镜")
+    machine._write_json(tl_path, timeline)
+    label = "、".join(f"第{s}镜" for s in sorted(ids)) if ids else "全部镜头"
+    return changed, label
 
 
 URL_RE = None
@@ -62,12 +145,11 @@ async def handle_chat(session_id: str, message: str, attachments=None):
 
     # ---- 门禁等待中的自然语言 ----
     if project and pstate.get("status") == "awaiting_gate":
-        low = message.strip().lower()
-        if any(w in low for w in ("确认", "可以", "继续", "通过", "ok", "好")) and len(low) < 20:
+        if gate_confirmed(message):
             async for chunk in handle_action(session_id, project, pstate, {"action": "confirm_gate"}):
                 yield chunk
             return
-        # 否则视为修改意见 → 修改模式
+        # 否定/含糊/修改意见 → 修改流（确认通过请走显式按钮）
         async for chunk in run_modify(session_id, project, message, attachments):
             yield chunk
         return
@@ -88,7 +170,10 @@ async def handle_chat(session_id: str, message: str, attachments=None):
         yield _sse("done", {})
         return
 
-    history = [{"role": m["role"], "content": m["content"]}
+    # 用户消息包上边界标记：内容只是数据，不是指令（D4 注入防护）
+    history = [{"role": m["role"],
+                "content": f"<user_input>{m['content']}</user_input>" if m["role"] == "user"
+                else m["content"]}
                for m in store.session_messages(session_id)[-20:]
                if m["kind"] == "text"]
     system = prompts.CLARIFY_SYSTEM if not project else prompts.CHAT_SYSTEM
@@ -161,10 +246,12 @@ async def handle_action(session_id, project, pstate, act: dict):
         if not provider:
             yield _sse("error", {"message": "未配置模型供应商"})
             return
-        # 提取简报
-        history = "\n".join(f"{m['role']}: {m['content']}"
-                            for m in store.session_messages(session_id)[-30:]
-                            if m["kind"] == "text")
+        # 提取简报（用户消息包边界标记，D4）
+        history = "\n".join(
+            f"{m['role']}: " + (f"<user_input>{m['content']}</user_input>"
+                                if m["role"] == "user" else m["content"])
+            for m in store.session_messages(session_id)[-30:]
+            if m["kind"] == "text")
         try:
             raw = await complete(provider, [{"role": "user", "content":
                                             prompts.BRIEF_EXTRACT.format(history=history)}])
@@ -175,15 +262,16 @@ async def handle_action(session_id, project, pstate, act: dict):
         title = brief.get("title") or "讲解视频"
         pid = store.create_project(title, tier)
         store.bind_project(session_id, pid)
-        pdir = store.project_dir(pid)
+        pdir = store.create_project_dir(pid)
         machine._write_json(pdir / "brief.json", brief)
         store.update_project(pid, title=title)
         yield _sse("project", {"project": store.get_project(pid), "brief": brief})
         yield _sse("token", {"text": f"已建立项目《{title}》，开始执行「{ {'concept':'创意档','storyboard':'分镜档','video':'成片档'}[tier] }」流水线。"})
         store.add_message(session_id, "assistant", f"已建立项目《{brief.get('title')}》")
         pl = machine.Pipeline(pid)
+        q = machine.BUS.subscribe(pid)
         machine.start_run(pid, pl.run_tier(tier))
-        async for chunk in stream_project_events(pid, session_id):
+        async for chunk in stream_project_events(pid, session_id, q):
             yield chunk
         return
 
@@ -199,8 +287,9 @@ async def handle_action(session_id, project, pstate, act: dict):
         sel = act.get("selected_direction")
         yield _sse("token", {"text": "已确认，继续流水线。"})
         store.add_message(session_id, "assistant", "已确认门禁，继续执行流水线。")
+        q = machine.BUS.subscribe(pid)
         machine.start_run(pid, pl.resume(selected_direction=sel))
-        async for chunk in stream_project_events(pid, session_id):
+        async for chunk in stream_project_events(pid, session_id, q):
             yield chunk
         return
 
@@ -209,8 +298,9 @@ async def handle_action(session_id, project, pstate, act: dict):
         text = f"升级到「{ {'storyboard':'分镜档','video':'成片档','concept':'创意档'}[tier] }」，继续执行。"
         yield _sse("token", {"text": text})
         store.add_message(session_id, "assistant", text)
+        q = machine.BUS.subscribe(pid)
         machine.start_run(pid, pl.upgrade_tier(tier))
-        async for chunk in stream_project_events(pid, session_id):
+        async for chunk in stream_project_events(pid, session_id, q):
             yield chunk
         return
 
@@ -225,16 +315,18 @@ async def handle_action(session_id, project, pstate, act: dict):
         text = f"重新执行阶段「{machine.STAGE_NAMES[stage]}」。"
         yield _sse("token", {"text": text})
         store.add_message(session_id, "assistant", text)
+        q = machine.BUS.subscribe(pid)
         machine.start_run(pid, pl._run_range(stage, end))
-        async for chunk in stream_project_events(pid, session_id):
+        async for chunk in stream_project_events(pid, session_id, q):
             yield chunk
         return
 
     if action == "resume_pipeline":
         yield _sse("token", {"text": "继续执行流水线。"})
         store.add_message(session_id, "assistant", "继续执行流水线。")
+        q = machine.BUS.subscribe(pid)
         machine.start_run(pid, pl.resume())
-        async for chunk in stream_project_events(pid, session_id):
+        async for chunk in stream_project_events(pid, session_id, q):
             yield chunk
         return
 
@@ -245,12 +337,19 @@ async def handle_action(session_id, project, pstate, act: dict):
         text = f"重试阶段「{machine.STAGE_NAMES[stage]}」。"
         yield _sse("token", {"text": text})
         store.add_message(session_id, "assistant", text)
+        q = machine.BUS.subscribe(pid)
         machine.start_run(pid, pl._run_range(stage, end))
-        async for chunk in stream_project_events(pid, session_id):
+        async for chunk in stream_project_events(pid, session_id, q):
             yield chunk
         return
 
     if action == "finish":
+        # 审片通过：把流水线状态落为 finished，否则徽章仍停在「待确认」（C-UX-03）
+        st = machine.load_state(pl.dir)
+        st["status"] = "finished"
+        st["gate"] = None
+        st.pop("error", None)
+        machine.save_state(pl.dir, st)
         yield _sse("token", {"text": "🎬 项目已完成！成片可在右侧产物栏查看下载。如需局部调整，随时在视频上标注或留言。"})
         store.update_project(pid, state="finished")
         yield _sse("suggestions", {"chips": [
@@ -282,7 +381,7 @@ async def run_modify(session_id, project, message, attachments):
     try:
         raw = await complete(provider, [
             {"role": "system", "content": prompts.MODIFY_SYSTEM},
-            {"role": "user", "content": f"修改要求：{message}{ann_text}{ctx}"}])
+            {"role": "user", "content": f"修改要求：<user_input>{message}</user_input>{ann_text}{ctx}"}])
         route = machine.extract_json(raw)
     except Exception as e:
         yield _sse("token", {"text": f"修改意图解析失败：{e}。请换种说法描述要改的内容。"})
@@ -300,8 +399,16 @@ async def run_modify(session_id, project, message, attachments):
     try:
         if branch == "voice":
             # 换音色/语速：重跑 8→11
+            q = machine.BUS.subscribe(pid)
             machine.start_run(pid, pl._run_range(8, 11))
         elif branch == "tts":
+            # 配音文本修改：把 instruction 写回 timeline.scenes[].tts，再重跑 8→11。
+            # tts 文本参与 TTS 缓存签名，因此改完会真正重新合成，不再是空转。
+            n, label = _apply_tts_instruction(pl.dir, route)
+            note = f"已更新{label}的配音文本（{n} 镜），重新配音并渲染。"
+            yield _sse("token", {"text": note})
+            store.add_message(session_id, "assistant", note)
+            q = machine.BUS.subscribe(pid)
             machine.start_run(pid, pl._run_range(8, 11))
         elif branch in ("visuals", "scene_redo"):
             # 画面修改：让视觉模型改 visuals.py（带进度播报），成功后重跑 7→11（关键帧门禁处暂停）
@@ -311,8 +418,10 @@ async def run_modify(session_id, project, message, attachments):
                 yield _sse("token", {"text": prog})
             store.add_message(session_id, "assistant",
                               "已按修改意见重写视觉代码并通过冒烟自检，正在重跑关键帧。")
+            q = machine.BUS.subscribe(pid)
             machine.start_run(pid, pl._run_range(7, 11))
         else:  # content 等：回到分镜
+            q = machine.BUS.subscribe(pid)
             machine.start_run(pid, pl._run_range(4, 11))
     except Exception as e:
         # 修改失败必须如实可见：播报 + 落盘 + 给出建议操作，且流水线保持原状态可继续
@@ -324,7 +433,7 @@ async def run_modify(session_id, project, message, attachments):
             store.get_project(pid), machine.load_state(pl.dir))})
         yield _sse("done", {})
         return
-    async for chunk in stream_project_events(pid, session_id):
+    async for chunk in stream_project_events(pid, session_id, q):
         yield chunk
 
 
@@ -360,8 +469,14 @@ async def _apply_visuals_fix(pl, route, message):
     pl.emit({"event": "artifact", "data": artifacts_note})
 
 
-async def stream_project_events(pid: str, session_id: str):
-    """订阅项目事件总线并转发为 SSE，直到流水线暂停/完成/失败。"""
+async def stream_project_events(pid: str, session_id: str, q=None):
+    """订阅项目事件总线并转发为 SSE，直到流水线暂停/完成/失败。
+
+    D1 改造：
+    - 调用方应在 start_run 之前 subscribe 并传入 q（消灭"启动后零进度"竞态窗口）；
+    - 15s 心跳保活，不再把"600s 无事件"误判为超时——查状态文件判断流水线是否仍在跑；
+    - 阶段/终态消息改由执行者（Pipeline._persist_note）单点落盘，此处不再写，
+      多标签页不再出现重复消息（C-REL-09）。"""
     # 极速竞态：run 在订阅前已到终态（如最后门禁确认后无剩余阶段），直接按当前状态收尾
     pre = machine.load_state(store.project_dir(pid))
     if pre.get("status") in ("tier_done", "failed") and not machine.is_running(pid):
@@ -372,15 +487,29 @@ async def stream_project_events(pid: str, session_id: str):
         yield _sse("suggestions", {"chips": chips_for(store.get_project(pid), pre)})
         yield _sse("done", {})
         return
-    q = machine.BUS.subscribe(pid)
-    chips = []
+    if q is None:
+        q = machine.BUS.subscribe(pid)
+    silent_pings = 0
     try:
         while True:
             try:
-                ev = await asyncio.wait_for(q.get(), timeout=600)
+                ev = await asyncio.wait_for(q.get(), timeout=15)
+                silent_pings = 0
             except asyncio.TimeoutError:
-                yield _sse("error", {"message": "流水线等待超时"})
-                break
+                # 心跳：保持连接活跃（代理/浏览器不会掐线），前端忽略 ping
+                yield _sse("ping", {})
+                silent_pings += 1
+                if silent_pings >= 4:
+                    # 60s 无任何事件：查状态文件。仍在跑就继续等；真死了按当前状态收尾
+                    st_now = machine.load_state(store.project_dir(pid))
+                    if st_now.get("status") != "running":
+                        yield _sse("token", {
+                            "text": f"\n流水线已停止运行（当前状态：{st_now.get('status')}）。\n"})
+                        yield _sse("suggestions",
+                                   {"chips": chips_for(store.get_project(pid), st_now)})
+                        break
+                    silent_pings = 0
+                continue
             kind = ev["event"]
             if kind == "stage_event":
                 d = ev["data"]
@@ -389,9 +518,6 @@ async def stream_project_events(pid: str, session_id: str):
                     yield _sse("token", {"text": f"\n**[{d['name']}]** 开始…\n"})
                 elif d["status"] == "completed":
                     yield _sse("token", {"text": f"[{d['name']}] 完成（{d.get('elapsed','?')}s）\n"})
-                    # 落盘：重进会话能看到每个阶段的执行记录
-                    store.add_message(session_id, "assistant",
-                                      f"✔ 阶段「{d['name']}」完成（{d.get('elapsed','?')}s）")
             elif kind == "artifact":
                 yield _sse("artifact", ev["data"])
             elif kind == "gate":
@@ -408,17 +534,6 @@ async def stream_project_events(pid: str, session_id: str):
                 project = store.get_project(pid)
                 pstate = machine.load_state(store.project_dir(pid))
                 yield _sse("suggestions", {"chips": chips_for(project, pstate)})
-                # 落盘终态结果：用户退出再进入时能判断流水线发生了什么
-                if kind == "gate":
-                    outcome = f"⏸️ 流水线暂停：需要人工确认「{ev['data'].get('name')}」。"
-                elif kind == "pipeline_done":
-                    outcome = "✅ 流水线执行完毕。"
-                elif kind == "interrupted":
-                    outcome = "⏹️ 已手动中断，可从流水线面板任意节点继续。"
-                else:
-                    outcome = (f"❌ 执行失败（{ev['data'].get('kind')}）："
-                               f"{str(ev['data'].get('message', ''))[:600]}")
-                store.add_message(session_id, "assistant", outcome)
                 break
     finally:
         machine.BUS.unsubscribe(pid, q)

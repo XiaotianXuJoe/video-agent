@@ -64,8 +64,31 @@ def get_artifact(proj_dir: Path, art_id: str) -> dict:
 
 
 def resolve_path(proj_dir: Path, rel_path: str) -> Path:
-    """防目录穿越：只允许项目目录内的文件。"""
-    p = (proj_dir / rel_path).resolve()
-    if not str(p).startswith(str(proj_dir.resolve())):
+    """防目录穿越：只允许项目目录内的文件。
+    用 resolve() + relative_to() 判包含关系，绝不用字符串前缀（'abc' 会被 'abc2' 前缀骗过）。"""
+    base = Path(proj_dir).resolve()
+    p = (base / rel_path).resolve()
+    try:
+        p.relative_to(base)
+    except ValueError:
         raise ValueError("path escape")
     return p
+
+
+def mask_extra(extra: dict | None) -> dict:
+    """对外回显的产物 metadata：音色 ID 只留后 4 位（完整值仅服务端使用）。"""
+    out = dict(extra or {})
+    vid = out.get("voice_id")
+    if vid:
+        s = str(vid)
+        out["voice_id"] = "***" + s[-4:] if len(s) >= 4 else "***"
+    return out
+
+
+def masked_artifact(art: dict) -> dict:
+    """产物对象的对外副本（不改注册表原文）。"""
+    return {**art, "extra": mask_extra(art.get("extra"))}
+
+
+def list_artifacts_masked(proj_dir: Path) -> list:
+    return [masked_artifact(a) for a in _load(proj_dir)]

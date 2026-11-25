@@ -104,7 +104,7 @@ def make_env(script_chat, script_machine=None):
         coro.close()
         return None
 
-    async def fake_stream_events(pid, sid):
+    async def fake_stream_events(pid, sid, q=None):
         yield chat._sse("token", {"text": "\n[mock] 阶段事件流\n"})
         yield chat._sse("done", {})
 

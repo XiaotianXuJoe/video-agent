@@ -75,6 +75,13 @@ def chips_for(project: dict, pipeline_state: dict) -> list:
             {"label": "查看流水线面板（可点击任意节点执行）", "action": "show_pipeline"},
         ]
 
+    if status == "finished":
+        return [
+            {"label": "标注修改视频", "action": "open_artifact", "artifact": "video"},
+            {"label": "查看 QC 报告", "action": "open_artifact", "artifact": "qc"},
+            {"label": "再做一个视频", "action": "new_chat"},
+        ]
+
     return [
         {"label": "生成创意方案", "action": "start_tier", "tier": "concept"},
         {"label": "直接生成分镜", "action": "start_tier", "tier": "storyboard"},

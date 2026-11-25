@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Clapperboard, Plus, Settings, Trash2, MessageSquare, PanelLeftClose, PanelLeftOpen, Sun, Moon, Pencil, Check, Activity, X } from 'lucide-react'
-import { api, streamChat, Session, Message, Project, PipelineState, Artifact, Chip, Annotation } from './lib/api'
+import { Clapperboard, Plus, Settings, Trash2, MessageSquare, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Sun, Moon, Pencil, Check, Activity, X } from 'lucide-react'
+import { api, streamChat, onAuthRequired, AuthRequiredError, Session, Message, Project, PipelineState, Artifact, Chip, Annotation, StageProgress } from './lib/api'
 import ChatView from './components/ChatView'
 import ArtifactPanel from './components/ArtifactPanel'
 import SettingsModal from './components/SettingsModal'
+import LoginGate from './components/LoginGate'
+import ToastContainer, { toastError } from './components/Toast'
 
 export interface LiveMsg { role: string; text: string; streaming?: boolean }
 
@@ -117,18 +119,36 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [busy, setBusy] = useState(false)
+  // 移动端（< md）：右侧面板改为底部抽屉（C-UX-05）
+  const [mobilePanelOpen, setMobilePanelOpen] = useState(false)
+  // 删除会话前的二次确认（C-UX-06）
+  const [pendingDelete, setPendingDelete] = useState<Session | null>(null)
+  // 长任务进度（仅内存态）：stage_event(status=progress)
+  const [stageProgress, setStageProgress] = useState<Record<number, StageProgress>>({})
+  // 鉴权覆盖层：任何 API 401 都会落到这里（kind 为 auth_required / auth_unconfigured）
+  const [authRequired, setAuthRequired] = useState<string | null>(null)
   const sessionRef = useRef(sid)
   sessionRef.current = sid
   // 流式回调是闭包，必须经 ref 取「当前项目」，否则新项目创建后
   // onStage/onGate/onDone 读到的仍是旧的 null，流水线状态永远不刷新
   const projectRef = useRef<string | null>(null)
+  // D1 事件游标：切项目时归零重新回放（见下方 running 轮询）
+  const lastSeqRef = useRef(0)
 
   const refreshProject = useCallback(async (pid: string) => {
+    if (projectRef.current !== pid) lastSeqRef.current = 0
     projectRef.current = pid
     const d = await api.project(pid)
     setProject(d.project); setPipeline(d.pipeline)
     setStageNames(d.stage_names); setChips(d.chips)
     setArtifacts(await api.artifacts(pid))
+  }, [])
+
+  /** 打开产物面板：桌面展开右侧栏，移动端同时弹出底部抽屉 */
+  const openPanel = useCallback((id: string) => {
+    setActiveArtifact(id)
+    setPanelOpen(true)
+    setMobilePanelOpen(true)
   }, [])
 
   const loadSession = useCallback(async (id: string) => {
@@ -148,14 +168,25 @@ export default function App() {
     }
   }, [refreshProject])
 
+  // 任何 API 401（含 SSE、上传、产物请求）都统一弹出登录层
+  useEffect(() => {
+    onAuthRequired(kind => setAuthRequired(kind))
+    return () => onAuthRequired(null)
+  }, [])
+
   useEffect(() => {
     (async () => {
-      const ss = await api.sessions()
-      if (ss.length === 0) {
-        const s = await api.newSession()
-        setSessions([s]); await loadSession(s.id)
-      } else {
-        setSessions(ss); await loadSession(ss[0].id)
+      try {
+        const ss = await api.sessions()
+        if (ss.length === 0) {
+          const s = await api.newSession()
+          setSessions([s]); await loadSession(s.id)
+        } else {
+          setSessions(ss); await loadSession(ss[0].id)
+        }
+      } catch (e) {
+        // 鉴权失败已由 onAuthRequired 接管；其他错误保持现有容错不发散
+        if (!(e instanceof AuthRequiredError)) console.error(e)
       }
     })()
   }, [loadSession])
@@ -172,7 +203,12 @@ export default function App() {
   }
 
   const deleteSession = async (id: string) => {
-    await api.delSession(id)
+    try {
+      await api.delSession(id)
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : '删除失败')
+      return
+    }
     let ss = await api.sessions()
     if (ss.length === 0) { const s = await api.newSession(); ss = [s] }
     setSessions(ss)
@@ -184,22 +220,40 @@ export default function App() {
     setBusy(true)
     setHistory(h => [...h, { id: `u${Date.now()}`, role: 'user', content: text, kind: attachments ? 'annotation' : 'text', payload: null, created: Date.now() / 1000 }])
     setLive({ role: 'assistant', text: '', streaming: true })
-    await streamChat(sessionRef.current, text, attachments, {
+    try {
+      await streamChat(sessionRef.current, text, attachments, {
       onToken: t => setLive(l => l ? { ...l, text: l.text + t } : l),
       onArtifact: a => {
         setArtifacts(prev => {
           const next = prev.filter(x => !(x.logical_name === a.logical_name && x.current))
           return [...next.map(x => x.logical_name === a.logical_name ? { ...x, current: false } : x), a]
         })
-        setActiveArtifact(a.id); setPanelOpen(true)
+        openPanel(a.id)
         if (projectRef.current) api.artifacts(projectRef.current).then(setArtifacts)
       },
       onProject: d => {
         projectRef.current = d.project.id
         setProject(d.project); refreshProject(d.project.id)
-        setPanelOpen(true); setActiveArtifact('__pipeline')
+        openPanel('__pipeline')
       },
-      onStage: () => { const pid = projectRef.current; if (pid) refreshProject(pid) },
+      onStage: d => {
+        // 进度事件只更新内存态，不刷新项目（渲染 5 分钟期间避免每 300 帧打一次 API）
+        if (d?.status === 'progress') {
+          setStageProgress(prev => ({ ...prev, [d.stage]: {
+            detail: d.detail, percent: d.percent, frames: d.frames, total_frames: d.total_frames,
+          } }))
+          return
+        }
+        if (d?.status === 'started' || d?.status === 'completed') {
+          setStageProgress(prev => {
+            if (!(d.stage in prev)) return prev
+            const next = { ...prev }
+            delete next[d.stage]
+            return next
+          })
+        }
+        const pid = projectRef.current; if (pid) refreshProject(pid)
+      },
       onGate: () => { const pid = projectRef.current; if (pid) refreshProject(pid) },
       onSuggestions: c => setChips(c),
       onSessionRenamed: d => {
@@ -214,9 +268,9 @@ export default function App() {
         if (a.action === 'open_artifact') {
           const art = artifacts.find(x => x.logical_name === a.artifact && x.current)
             || artifacts.find(x => x.logical_name === a.artifact)
-          if (art) { setActiveArtifact(art.id); setPanelOpen(true) }
+          if (art) openPanel(art.id)
         }
-        if (a.action === 'open_refs') { setPanelOpen(true); setActiveArtifact('__refs') }
+        if (a.action === 'open_refs') openPanel('__refs')
         if (a.action === 'new_chat') newChat()
       },
       onError: e => setLive(l => ({ role: 'assistant', text: (l?.text || '') + `\n\n❌ ${e.message || '出错了'}` })),
@@ -229,9 +283,16 @@ export default function App() {
         const pid = projectRef.current
         if (pid) refreshProject(pid)
       },
-    })
-    setBusy(false)
-  }, [busy, artifacts, refreshProject])
+      })
+    } catch (e) {
+      // 401 已触发全局登录层；其他异常显示在对话里，不静默吞掉
+      if (!(e instanceof AuthRequiredError)) {
+        setLive(l => ({ role: 'assistant', text: (l?.text || '') + `\n\n❌ ${e instanceof Error ? e.message : '出错了'}` }))
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [busy, artifacts, refreshProject, openPanel])
 
   const chipClick = (c: Chip) => {
     if (c.action === 'free_text') return // 仅提示用户输入
@@ -239,12 +300,12 @@ export default function App() {
     if (c.action === 'open_artifact') {
       const art = artifacts.find(x => x.logical_name === c.artifact && x.current)
         || artifacts.find(x => x.logical_name === c.artifact)
-      if (art) { setActiveArtifact(art.id); setPanelOpen(true) }
+      if (art) openPanel(art.id)
       return
     }
-    if (c.action === 'open_refs') { setPanelOpen(true); setActiveArtifact('__refs'); return }
+    if (c.action === 'open_refs') { openPanel('__refs'); return }
     if (c.action === 'new_chat') { newChat(); return }
-    if (c.action === 'show_pipeline') { setPanelOpen(true); setActiveArtifact('__pipeline'); return }
+    if (c.action === 'show_pipeline') { openPanel('__pipeline'); return }
     if (c.action === 'show_error') { send(`当前失败详情是什么？`); return }
     if (c.action === 'start_chat') { send(c.hint === '发给我题目和正确代码，我们开始' ? '我想制作一个算法讲解视频' : '我想制作一个科普讲解视频'); return }
     send(`__action:${JSON.stringify(c)}`)
@@ -254,14 +315,44 @@ export default function App() {
     send(`__action:${JSON.stringify({ action: 'confirm_gate', selected_direction: selected ?? null })}`)
   }
 
-  // 流水线运行期间轮询刷新：面板发起的单点执行没有对话流事件，靠轮询保证实时可见
+  // 流水线运行期间：事件游标轮询（D1 事件落表回放）。
+  // 只有 seq 前进（真的发生新事件）才全量刷新项目，替代原来 2s×3 接口的盲刷；
+  // 连续失败时指数退避（15s → 30s → 60s 封顶），恢复后自动回到 15s。
   useEffect(() => {
     if (pipeline?.status !== 'running') return
-    const timer = setInterval(() => {
+    let failures = 0
+    let timer: ReturnType<typeof setTimeout>
+    let stopped = false
+    const tick = async () => {
       const pid = projectRef.current
-      if (pid) refreshProject(pid)
-    }, 2000)
-    return () => clearInterval(timer)
+      if (stopped || !pid) { schedule(); return }
+      try {
+        const ev = await api.projectEvents(pid, lastSeqRef.current)
+        failures = 0
+        if (ev.events.length > 0) {
+          lastSeqRef.current = ev.latest
+          // 合并最新 progress 到内存态，驱动面板进度条（与对话流 onStage 同一出口）
+          for (const e of ev.events) {
+            if (e.type === 'stage_event' && e.payload?.status === 'progress') {
+              const d = e.payload
+              setStageProgress(prev => ({ ...prev, [d.stage]: {
+                detail: d.detail, percent: d.percent,
+                frames: d.frames, total_frames: d.total_frames } }))
+            }
+          }
+          await refreshProject(pid)
+        }
+      } catch (err) {
+        failures = Math.min(failures + 1, 3)
+        if (!(err instanceof AuthRequiredError)) console.warn('events poll failed', err)
+      }
+      schedule()
+    }
+    const schedule = () => {
+      timer = setTimeout(tick, 15000 * Math.max(1, failures))
+    }
+    schedule()
+    return () => { stopped = true; clearTimeout(timer) }
   }, [pipeline?.status, refreshProject])
 
   const runStage = async (stage: number) => {
@@ -272,7 +363,7 @@ export default function App() {
       setPipeline(pl => pl ? { ...pl, status: 'running', stage } : pl)
       setTimeout(() => { if (projectRef.current) refreshProject(projectRef.current) }, 300)
     } catch (e) {
-      alert(e instanceof Error ? e.message : '启动失败')
+      toastError(e instanceof Error ? e.message : '启动失败')
     }
   }
 
@@ -327,6 +418,21 @@ export default function App() {
 
   const groups = GROUP_ORDER.map(g => ({ name: g, items: sessions.filter(s => timeGroup(s.updated) === g) })).filter(g => g.items.length > 0)
 
+  // 右侧面板内容：桌面侧栏与移动端抽屉共用（C-UX-05）
+  const panelBody = (close: () => void) => project ? (
+    <ArtifactPanel project={project} pipeline={pipeline} stageNames={stageNames}
+      artifacts={artifacts} activeId={activeArtifact} setActiveId={setActiveArtifact}
+      onClose={close} onSend={send} onConfirmGate={confirmGate}
+      onRunStage={runStage} onStop={stopProject} stageProgress={stageProgress} />
+  ) : (
+    <EmptyPipelinePanel onClose={close} />
+  )
+
+  // 鉴权门：未登录时只渲染登录层（登录成功后整页刷新，重新拉取全部状态）
+  if (authRequired) {
+    return <LoginGate kind={authRequired} onSuccess={() => window.location.reload()} />
+  }
+
   return (
     <div className="h-full flex min-w-0">
       {/* 会话侧栏 */}
@@ -350,7 +456,7 @@ export default function App() {
                   <SessionItem key={s.id} s={s} active={s.id === sid}
                     projectTitle={s.id === sid ? project?.title : undefined}
                     onLoad={() => loadSession(s.id)}
-                    onDelete={() => deleteSession(s.id)}
+                    onDelete={() => setPendingDelete(s)}
                     onRename={t => renameSession(s.id, t)} />
                 ))}
               </div>
@@ -374,9 +480,12 @@ export default function App() {
           <div className="flex-1" />
           {pipeline && (
             <span className={`text-xs px-2 py-0.5 rounded-full ${pipeline.status === 'awaiting_gate' ? 'bg-amberx/15 text-amberx' : pipeline.status === 'running' ? 'bg-accent/15 text-accent' : pipeline.status === 'failed' ? 'bg-red-400/15 text-red-400' : pipeline.status === 'paused' ? 'bg-mute/15 text-mute' : 'bg-greenx/15 text-greenx'}`}>
-              {pipeline.status === 'awaiting_gate' ? `待确认：${pipeline.gate?.name}` : pipeline.status === 'running' ? `执行中：${stageNames[pipeline.stage] || ''}` : pipeline.status === 'failed' ? '失败' : pipeline.status === 'paused' ? '已暂停' : pipeline.status === 'tier_done' ? '本档完成' : pipeline.status}
+              {pipeline.status === 'awaiting_gate' ? `待确认：${pipeline.gate?.name}` : pipeline.status === 'running' ? `执行中：${stageNames[pipeline.stage] || ''}` : pipeline.status === 'failed' ? '失败' : pipeline.status === 'paused' ? '已暂停' : pipeline.status === 'tier_done' ? '本档完成' : pipeline.status === 'finished' ? '已完成' : pipeline.status}
             </span>
           )}
+          <button onClick={() => setMobilePanelOpen(o => !o)} className="md:hidden p-2 rounded-lg text-mute hover:text-accent hover:bg-panel2" title={mobilePanelOpen ? '收起产物面板' : '打开产物面板'}>
+            {mobilePanelOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
+          </button>
           <button onClick={toggleTheme} className="p-2 rounded-lg text-mute hover:text-accent hover:bg-panel2" title={theme === 'dark' ? '切换浅色' : '切换深色'}>
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
@@ -399,14 +508,7 @@ export default function App() {
                 <div className="absolute top-1/2 -translate-y-1/2 left-0 w-[5px] h-8 rounded-full bg-mute/0 group-hover:bg-accent/40 transition-colors" />
               </div>
               <aside style={{ width: panelW }} className="shrink-0 hidden md:block">
-                {project ? (
-                  <ArtifactPanel project={project} pipeline={pipeline} stageNames={stageNames}
-                    artifacts={artifacts} activeId={activeArtifact} setActiveId={setActiveArtifact}
-                    onClose={() => setPanelOpen(false)} onSend={send} onConfirmGate={confirmGate}
-                    onRunStage={runStage} onStop={stopProject} />
-                ) : (
-                  <EmptyPipelinePanel onClose={() => setPanelOpen(false)} />
-                )}
+                {panelBody(() => setPanelOpen(false))}
               </aside>
             </>
           )}
@@ -414,6 +516,46 @@ export default function App() {
       </div>
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+
+      {/* 移动端底部抽屉：md 以下不再隐藏产物/关键帧/视频/QC（C-UX-05） */}
+      {mobilePanelOpen && (
+        <div className="md:hidden fixed inset-0 z-40 flex flex-col justify-end bg-black/50"
+          onClick={() => setMobilePanelOpen(false)}>
+          <div className="h-[78vh] flex flex-col bg-panel border-t border-edge rounded-t-2xl overflow-hidden"
+            style={{ boxShadow: 'var(--shadow)' }} onClick={e => e.stopPropagation()}>
+            <div className="shrink-0 relative flex items-center justify-center py-2 border-b border-edge">
+              <span className="w-10 h-1 rounded-full bg-edge" />
+              <button onClick={() => setMobilePanelOpen(false)}
+                className="absolute right-2 p-1.5 text-mute hover:text-ink" title="收起"><X size={15} /></button>
+            </div>
+            <div className="flex-1 min-h-0">{panelBody(() => setMobilePanelOpen(false))}</div>
+          </div>
+        </div>
+      )}
+
+      {/* 删除会话二次确认（C-UX-06） */}
+      {pendingDelete && (
+        <div className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center p-4"
+          onClick={() => setPendingDelete(null)}>
+          <div className="w-full max-w-sm bg-panel border border-edge rounded-2xl p-5"
+            style={{ boxShadow: 'var(--shadow)' }} onClick={e => e.stopPropagation()}>
+            <div className="font-semibold mb-2 flex items-center gap-2">
+              <Trash2 size={15} className="text-red-400" /> 删除这个对话？
+            </div>
+            <div className="text-sm text-mute mb-4 leading-6">
+              「{pendingDelete.title || '新对话'}」及其消息将从数据库中彻底删除，无法恢复。
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setPendingDelete(null)}
+                className="px-4 h-9 rounded-lg border border-edge text-sm text-mute hover:text-ink">取消</button>
+              <button onClick={() => { const id = pendingDelete.id; setPendingDelete(null); deleteSession(id) }}
+                className="px-4 h-9 rounded-lg bg-red-400/90 text-onaccent text-sm font-medium hover:brightness-110">删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ToastContainer />
     </div>
   )
 }

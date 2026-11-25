@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, Artifact, Project, Annotation } from '../lib/api'
+import { api, annSnapshotUrl, Artifact, Project, Annotation } from '../lib/api'
 import { Flag, Scissors, Send, SquarePen, X } from 'lucide-react'
 
 interface Shape { kind: 'rect'; x: number; y: number; w: number; h: number } // 视频原始像素坐标
@@ -20,10 +20,16 @@ export default function VideoViewer({ project, artifact, onSend }: {
   const [seg, setSeg] = useState<{ a: number | null; b: number | null }>({ a: null, b: null })
   const [comment, setComment] = useState('')
   const [showComment, setShowComment] = useState(false)
+  // 已保存标注（快照新格式走文件端点，旧数据内联 base64，两者都能展示）
+  const [savedAnns, setSavedAnns] = useState<Annotation[]>([])
   const videoSrc = api.fileUrl(project.id, artifact.path)
 
   useEffect(() => {
     fetch(api.fileUrl(project.id, 'timeline.json')).then(r => r.json()).then(setTimeline).catch(() => {})
+  }, [project.id, artifact.id])
+
+  useEffect(() => {
+    api.annotations(project.id).then(setSavedAnns).catch(() => setSavedAnns([]))
   }, [project.id, artifact.id])
 
   const sceneAt = useCallback((t: number) => {
@@ -93,6 +99,7 @@ export default function VideoViewer({ project, artifact, onSend }: {
   }
 
   const fmt = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`
+  const shotAnns = savedAnns.filter(a => a.snapshot_path || a.snapshot).slice(-8)
 
   return (
     <div className="flex flex-col h-full">
@@ -130,6 +137,19 @@ export default function VideoViewer({ project, artifact, onSend }: {
               </button>
             )
           })}
+        </div>
+      )}
+
+      {/* 已保存标注快照：新格式读文件，旧数据内联 base64（C-UX-09 兼容） */}
+      {shotAnns.length > 0 && (
+        <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 border-b border-edge bg-base/40 overflow-x-auto">
+          <span className="shrink-0 text-[11px] text-mute">已存标注</span>
+          {shotAnns.map(a => (
+            <button key={a.id} title={a.comment || '标注'} onClick={() => seek(a.t_start)}
+              className="shrink-0 rounded border border-edge hover:border-accent/60 transition-colors overflow-hidden">
+              <img src={annSnapshotUrl(project.id, a)} alt="标注快照" className="h-9 w-auto block" />
+            </button>
+          ))}
         </div>
       )}
 

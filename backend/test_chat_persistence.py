@@ -35,6 +35,8 @@ def make_env(state):
     store.project_dir = lambda pid: d
     store.add_message = lambda sid, role, content, kind="text", payload=None: \
         messages.append(content)
+    # 执行者单写模型（D3/C-REL-09）：事件经 Pipeline.emit 落盘，需有绑定会话
+    store.session_for_project = lambda pid: "s1"
     store.get_project = lambda pid: {"id": pid, "title": "T", "state": state["status"], "stage": state["stage"]}
     return d, messages
 
@@ -43,7 +45,7 @@ async def case_A():
     d, messages = make_env({"stage": 7, "status": "awaiting_gate",
                             "gate": {"stage": 7, "name": "关键帧确认"}, "tier": "video", "log": []})
 
-    async def fake_stream(pid, sid):
+    async def fake_stream(pid, sid, q=None):
         yield chat._sse("done", {})
 
     chat.stream_project_events = fake_stream
@@ -65,12 +67,17 @@ async def case_BCD():
 
     task = asyncio.create_task(drive())
     await asyncio.sleep(0.2)
-    machine.BUS.publish("p1", {"event": "stage_event", "data": {
+    # 执行者单写：事件经 Pipeline.emit 发布（内部落盘 + 订阅分发），
+    # 订阅侧（stream_project_events）不再写消息——多标签不再重复
+    pl = machine.Pipeline("p1")
+    pl.emit({"event": "stage_event", "data": {
         "stage": 6, "name": "视觉代码", "status": "completed", "elapsed": 61.2}})
     await asyncio.sleep(0.05)
-    machine.BUS.publish("p1", {"event": "gate", "data": {"stage": 7, "name": "关键帧确认"}})
+    pl.emit({"event": "gate", "data": {"stage": 7, "name": "关键帧确认"}})
     chunks = await asyncio.wait_for(task, timeout=5)
     check("B1 阶段完成落盘", any("✔ 阶段「视觉代码」完成（61.2s）" in m for m in messages), str(messages))
+    check("B1b 订阅侧不写重复消息",
+          len([m for m in messages if "阶段「视觉代码」完成" in m]) == 1, str(messages))
     check("C1 门禁暂停终态落盘", any("需要人工确认「关键帧确认」" in m for m in messages))
     check("C2 门禁时给出 chips", any("suggestions" in c for c in chunks))
     shutil.rmtree(d, ignore_errors=True)
@@ -85,7 +92,8 @@ async def case_D():
 
     task = asyncio.create_task(drive())
     await asyncio.sleep(0.2)
-    machine.BUS.publish("p1", {"event": "error", "data": {"kind": "stage_error", "message": long_msg}})
+    pl = machine.Pipeline("p1")
+    pl.emit({"event": "error", "data": {"kind": "stage_error", "message": long_msg}})
     await asyncio.wait_for(task, timeout=5)
     fail_msgs = [m for m in messages if m.startswith("❌ 执行失败")]
     check("D1 失败终态落盘", len(fail_msgs) == 1, str(messages)[:80])

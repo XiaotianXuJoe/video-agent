@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""视觉代码冒烟渲染：对每镜在 start/mid/end 三个时间点调用 render_visual，
-验证每次调用都返回合法的 1920x1080 PIL 图像。不保存任何文件，专供阶段 6
-生成后自检（在关键帧/整片渲染之前提前暴露坐标越界、KeyError 等运行时错误）。
+"""视觉代码冒烟渲染：先做静态检查（镜号/标题规范），再对每镜在 start/mid/end
+三个时间点调用 render_visual，验证每次调用都返回合法的 1920x1080 PIL 图像。
+不保存任何文件，专供阶段 6 生成后自检（在关键帧/整片渲染之前提前暴露坐标越界、
+镜号残留、标题不统一、KeyError 等运行时错误）。
 用法: python3 visuals_smoke.py --project /path/to/project
 退出码 0=通过，1=失败（失败细节以 JSON 打在 stdout 最后一行）。"""
 import argparse
@@ -10,6 +11,9 @@ import json
 import sys
 import traceback
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from visuals_lint import lint_visuals_source  # noqa: E402
 
 
 def fail(phase, **kw):
@@ -25,6 +29,20 @@ def main():
     args = ap.parse_args()
     proj = args.project
     timeline = json.loads((proj / 'timeline.json').read_text(encoding='utf-8'))
+    # 静态检查先跑：镜号残留 / 标题不统一不需要执行代码就能发现
+    lint = {'errors': [], 'warnings': []}
+    try:
+        lint = lint_visuals_source((proj / 'visuals.py').read_text(encoding='utf-8'))
+    except OSError:
+        fail('lint', error='无法读取 visuals.py')
+    if lint['errors']:
+        print(json.dumps({'ok': False, 'phase': 'lint',
+                          'error': '静态检查未通过: ' + '；'.join(lint['errors']),
+                          'lint_errors': lint['errors'],
+                          'warnings': lint['warnings']}, ensure_ascii=False))
+        sys.exit(1)
+    if lint['warnings']:
+        print('静态检查告警: ' + '；'.join(lint['warnings']), file=sys.stderr)
     try:
         spec = importlib.util.spec_from_file_location('visuals_smoke', proj / 'visuals.py')
         mod = importlib.util.module_from_spec(spec)
