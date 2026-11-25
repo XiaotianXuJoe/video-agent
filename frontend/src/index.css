@@ -1,0 +1,97 @@
+@import "tailwindcss";
+
+/* 双主题：设计令牌引用运行时变量，[data-theme] 切换 */
+:root {
+  --bg: #0B1220;
+  --panel: #111A2E;
+  --panel2: #16213A;
+  --edge: #1E2A44;
+  --ink: #E2E8F0;
+  --mute: #8A97B1;
+  --accent: #5DE2E7;
+  --amber: #FFB86B;
+  --green: #71E6A4;
+  --purple: #A78BFA;
+  --on-accent: #0B1220;
+  --glass: rgba(17, 26, 46, 0.72);
+  --scroll-thumb: #243354;
+  --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="light"] {
+  --bg: #F7F8FA;
+  --panel: #FFFFFF;
+  --panel2: #F0F2F5;
+  --edge: #E2E6EC;
+  --ink: #1A2333;
+  --mute: #5B6B82;
+  --accent: #0E9BA8;
+  --amber: #D97B1A;
+  --green: #1E9E5C;
+  --purple: #7C5CE0;
+  --on-accent: #FFFFFF;
+  --glass: rgba(255, 255, 255, 0.78);
+  --scroll-thumb: #C9D2DE;
+  --shadow: 0 8px 32px rgba(26, 35, 51, 0.12);
+}
+
+@theme inline {
+  --color-base: var(--bg);
+  --color-panel: var(--panel);
+  --color-panel2: var(--panel2);
+  --color-edge: var(--edge);
+  --color-ink: var(--ink);
+  --color-mute: var(--mute);
+  --color-accent: var(--accent);
+  --color-amberx: var(--amber);
+  --color-greenx: var(--green);
+  --color-purplex: var(--purple);
+  --color-onaccent: var(--on-accent);
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  font-size: 15px;
+  line-height: 1.65;
+  transition: background .2s ease, color .2s ease;
+}
+.mono { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+.fade-in { animation: fadeIn .18s ease-out; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+/* 玻璃拟态顶栏 */
+.glass-bar {
+  background: var(--glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+/* 设置页统一输入规格：36px 高 */
+.field-input {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--edge);
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 13px;
+  outline: none;
+  width: 100%;
+  transition: border-color .15s ease;
+}
+.field-input:focus { border-color: var(--accent); }
+.field-input::placeholder { color: var(--mute); opacity: .6; }
+select.field-input { padding-right: 28px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .fade-in { animation: none; }
+  * { transition: none !important; }
+}
